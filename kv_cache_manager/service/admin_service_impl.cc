@@ -1,5 +1,6 @@
 #include "kv_cache_manager/service/admin_service_impl.h"
 
+#include <map>
 #include <memory>
 #include <string>
 #include <utility>
@@ -9,11 +10,19 @@
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/leader_elector.h"
 #include "kv_cache_manager/config/node_endpoint_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
+#include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/manager/cache_manager.h"
+#include "kv_cache_manager/manager/meta_searcher.h"
+#include "kv_cache_manager/manager/migration_manager.h"
+#include "kv_cache_manager/meta/cache_location.h"
+#include "kv_cache_manager/meta/common.h"
+#include "kv_cache_manager/meta/meta_indexer.h"
+#include "kv_cache_manager/meta/meta_indexer_manager.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/metrics/metrics_reporter.h"
 #include "kv_cache_manager/protocol/protobuf/admin_service.pb.h"
@@ -486,6 +495,184 @@ void AdminServiceImpl::RemoveCache(RequestContext *request_context,
         KVCM_LOG_INFO("[traceId: %s] RemoveCache succeeded", request->trace_id().c_str());
     }
 };
+
+std::vector<std::int64_t>
+AdminServiceImpl::SelectMigrationCandidateKeys(RequestContext *request_context,
+                                               const proto::admin::MigrateCacheRequest *request,
+                                               const std::shared_ptr<MetaIndexer> &meta_indexer) const {
+    std::vector<std::int64_t> candidate_keys;
+    if (!request->block_keys().empty()) {
+        candidate_keys.assign(request->block_keys().begin(), request->block_keys().end());
+        return candidate_keys;
+    }
+
+    constexpr int64_t kDefaultMigrateSampleCount = 100;
+    const auto &rule = request->rule();
+    const int64_t sample_count = rule.sample_count() > 0 ? rule.sample_count() : kDefaultMigrateSampleCount;
+    if (const auto ec = meta_indexer->SampleReclaimKeys(request_context, sample_count, candidate_keys); ec != EC_OK) {
+        KVCM_LOG_WARN("[traceId: %s] MigrateCache sample keys failed, ec %d", request->trace_id().c_str(), ec);
+    }
+
+    // min_age_ms：基于 PROPERTY_LRU_TIME 的未访问时长(idle)近似过滤（无 block create-time 属性）。
+    if (rule.min_age_ms() <= 0 || candidate_keys.empty()) {
+        return candidate_keys;
+    }
+
+    std::vector<std::map<std::string, std::string>> prop_maps;
+    const auto res = meta_indexer->GetProperties(request_context, candidate_keys, {PROPERTY_LRU_TIME}, prop_maps);
+    if (res.ec != EC_OK || prop_maps.size() != candidate_keys.size()) {
+        return candidate_keys;
+    }
+
+    const int64_t now_us = TimestampUtil::GetCurrentTimeUs();
+    const int64_t min_age_us = rule.min_age_ms() * 1000;
+    std::vector<int64_t> filtered;
+    filtered.reserve(candidate_keys.size());
+    for (size_t i = 0; i < candidate_keys.size(); ++i) {
+        const auto it = prop_maps[i].find(PROPERTY_LRU_TIME);
+        if (it == prop_maps[i].end()) {
+            filtered.push_back(candidate_keys[i]); // 无属性 -> 不排除
+            continue;
+        }
+        int64_t lru_us = 0;
+        if (StringUtil::StrToInt64(it->second.c_str(), lru_us) && (now_us - lru_us) >= min_age_us) {
+            filtered.push_back(candidate_keys[i]);
+        }
+    }
+    return filtered;
+}
+
+void AdminServiceImpl::MigrateCache(RequestContext *request_context,
+                                    const proto::admin::MigrateCacheRequest *request,
+                                    proto::admin::MigrateCacheResponse *response) {
+    API_CALL_GUARD("MigrateCache", true);
+    auto *header = response->mutable_header();
+    auto *status = header->mutable_status();
+    std::string invalid_fields = "missing or invalid fields: ";
+
+    if (request->instance_id().empty()) {
+        CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("MigrateCache", "instance_id", true);
+    }
+    if (request->source_storage_name().empty()) {
+        CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("MigrateCache", "source_storage_name", true);
+    }
+    if (request->target_storage_name().empty()) {
+        CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("MigrateCache", "target_storage_name", true);
+    }
+    const auto method = request->method();
+    if (method == proto::admin::MIGRATION_METHOD_UNSPECIFIED) {
+        CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("MigrateCache", "method", true);
+    }
+
+    const std::string &instance_id = request->instance_id();
+    const std::string &src_name = request->source_storage_name();
+    const std::string &dst_name = request->target_storage_name();
+    const bool do_copy =
+        method == proto::admin::MIGRATION_METHOD_COPY || method == proto::admin::MIGRATION_METHOD_BOTH;
+    const bool do_mark =
+        method == proto::admin::MIGRATION_METHOD_MARK || method == proto::admin::MIGRATION_METHOD_BOTH;
+
+    auto migration_manager = cache_manager_->migration_manager();
+    auto meta_indexer_manager = cache_manager_->meta_indexer_manager();
+    if (migration_manager == nullptr || meta_indexer_manager == nullptr) {
+        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_message("migration manager not available");
+        request_context->set_status_code(status->code());
+        return;
+    }
+    auto meta_indexer = meta_indexer_manager->GetMetaIndexer(instance_id);
+    if (meta_indexer == nullptr) {
+        status->set_code(proto::admin::INSTANCE_NOT_EXIST);
+        status->set_message("instance not found: " + instance_id);
+        request_context->set_status_code(status->code());
+        return;
+    }
+
+    // 1. 选候选 block_keys：显式 block_keys 优先；否则按 rule 采样 + 过滤
+    const std::vector<int64_t> candidate_keys = SelectMigrationCandidateKeys(request_context, request, meta_indexer);
+
+    const int64_t total = static_cast<int64_t>(candidate_keys.size());
+    if (candidate_keys.empty()) {
+        response->set_accepted(0);
+        response->set_rejected(0);
+        status->set_code(proto::admin::OK);
+        status->set_message("no candidate to migrate");
+        request_context->set_status_code(status->code());
+        return;
+    }
+
+    // 2. 取各 block 的 location，准入过滤（在源 storage 上、SERVING、未在迁移中、目标无副本）
+    MetaSearcher meta_searcher(meta_indexer);
+    std::vector<CacheLocationMap> loc_maps;
+    BlockMask empty_mask;
+    if (const auto ec = meta_searcher.BatchGetLocation(request_context, candidate_keys, empty_mask, loc_maps);
+        ec != EC_OK || loc_maps.size() != candidate_keys.size()) {
+        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_message("get cache location failed");
+        request_context->set_status_code(status->code());
+        return;
+    }
+
+    std::vector<int64_t> mark_keys;
+    std::vector<int64_t> copy_keys;
+    std::vector<MigrationManager::MigrationRequest> copy_reqs;
+    for (size_t i = 0; i < candidate_keys.size(); ++i) {
+        const int64_t block_key = candidate_keys[i];
+        const auto admission = migration_manager->CheckCopyAdmission(block_key, loc_maps[i], src_name, dst_name);
+        if (admission.status != MigrationManager::CopyAdmissionStatus::kAccept ||
+            admission.src_location == nullptr) {
+            continue; // 已在迁移中 / 目标已有副本 / 不在源 storage 上
+        }
+        if (do_copy) {
+            MigrationManager::MigrationRequest req;
+            req.instance_id = instance_id;
+            req.block_key = block_key;
+            req.src_location_id = admission.src_location->id();
+            req.src_storage_name = src_name;
+            req.dst_storage_name = dst_name;
+            req.retention = MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE; // API 触发默认删源
+            copy_keys.push_back(block_key);
+            copy_reqs.push_back(std::move(req));
+            continue; // Copy 优先：BOTH 时已进入 copy 的 block 不再重复 mark。
+        }
+        if (do_mark) {
+            mark_keys.push_back(block_key);
+        }
+    }
+
+    // 3. 分发：Copy -> BatchSubmit（统计 EC_OK），Mark -> MarkForTieredWrite（copy 未接纳的候选）
+    int64_t accepted = 0;
+    if (do_copy && !copy_reqs.empty()) {
+        const auto results = migration_manager->BatchSubmit(request->trace_id(), std::move(copy_reqs));
+        for (size_t i = 0; i < results.size(); ++i) {
+            const auto ec = results[i];
+            if (ec == EC_OK) {
+                ++accepted;
+            } else if (do_mark && i < copy_keys.size()) {
+                mark_keys.push_back(copy_keys[i]);
+            }
+        }
+    }
+    if (do_mark && !mark_keys.empty()) {
+        migration_manager->MarkForTieredWrite(instance_id, mark_keys, dst_name);
+        accepted += static_cast<int64_t>(mark_keys.size());
+    }
+    const int64_t rejected = total - accepted;
+
+    response->set_accepted(accepted);
+    response->set_rejected(rejected);
+    status->set_code(proto::admin::OK);
+    status->set_message("migrate cache dispatched");
+    request_context->set_status_code(status->code());
+    KVCM_LOG_INFO("[traceId: %s] MigrateCache instance %s src %s dst %s method %d accepted %lld rejected %lld",
+                  request->trace_id().c_str(),
+                  instance_id.c_str(),
+                  src_name.c_str(),
+                  dst_name.c_str(),
+                  static_cast<int>(method),
+                  static_cast<long long>(accepted),
+                  static_cast<long long>(rejected));
+}
 
 // Instance相关接口实现
 void AdminServiceImpl::RegisterInstance(RequestContext *request_context,

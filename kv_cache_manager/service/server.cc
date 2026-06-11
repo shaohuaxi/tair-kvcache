@@ -92,6 +92,7 @@ void Server::OnBecomeLeader() {
         return;
     }
     cache_manager_->ResumeReclaimer();
+    cache_manager_->StartMigrationManager();
 
     meta_impl_->EnableLeaderOnlyRequests();
     admin_impl_->EnableLeaderOnlyRequests();
@@ -101,6 +102,7 @@ void Server::OnBecomeLeader() {
 void Server::OnNoLongerLeader() {
     KVCM_LOG_INFO("Server demoted to standby, starting cleanup...");
     cache_manager_->PauseReclaimer();
+    cache_manager_->StopMigrationManager();
 
     meta_impl_->DisableLeaderOnlyRequests();
     admin_impl_->DisableLeaderOnlyRequests();

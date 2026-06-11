@@ -15,10 +15,15 @@
 #include "kv_cache_manager/manager/cache_location_view.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/cache_reclaimer.h"
+#include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/manager/meta_searcher_manager.h"
+#include "kv_cache_manager/manager/migration_manager.h"
 #include "kv_cache_manager/manager/reclaimer_task_supervisor.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
 #include "kv_cache_manager/manager/startup_config_loader.h"
+#include "kv_cache_manager/manager/write_location_manager.h"
+#include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
@@ -2527,6 +2532,159 @@ TEST_F(CacheManagerTest, TestRecoverRetryLoopLifecycle) {
     cache_manager_->StartRecoverRetryLoop();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
+}
+
+// ===== 多层存储 Mark 消费（写路径）=====
+
+// FilterWriteCache 统一入口：命中 mark 的 block 记录目标冷 storage（未命中为空）
+TEST_F(CacheManagerTest, TestFilterWriteCacheTieredMarkPropagation) {
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "placeholder_id",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("placeholder_id");
+    ASSERT_TRUE(meta_searcher);
+
+    // 持久化打标要求 block 先存在：给 block 1 建一个 location。
+    {
+        auto loc = std::make_shared<CacheLocation>(
+            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+            1,
+            std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot/blk1?size=1")});
+        std::vector<std::string> ids;
+        ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {loc}, ids));
+    }
+    cache_manager_->migration_manager()->MarkForTieredWrite("placeholder_id", {1}, "cold_01");
+
+    CacheManager::KeyVector keys = {1, 2};
+    CacheManager::KeyVector new_keys;
+    std::vector<std::string_view> new_sgn;
+    BlockMask block_mask;
+    std::vector<std::string> new_targets;
+    auto ec = cache_manager_->FilterWriteCache(
+        request_context_.get(), "placeholder_id", meta_searcher, keys, new_keys, {}, new_sgn, block_mask, new_targets);
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(2u, new_keys.size());
+    ASSERT_EQ(new_keys.size(), new_targets.size());
+    for (size_t i = 0; i < new_keys.size(); ++i) {
+        if (new_keys[i] == 1) {
+            ASSERT_EQ("cold_01", new_targets[i]); // 命中 mark -> 目标冷 storage
+        } else {
+            ASSERT_EQ("", new_targets[i]); // 未命中 -> 空（走默认）
+        }
+    }
+}
+
+TEST_F(CacheManagerTest, TestFilterWriteCacheTieredMarkSkipsExistingTarget) {
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "placeholder_id",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("placeholder_id");
+    ASSERT_TRUE(meta_searcher);
+
+    auto writing_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("tp0", "dummy://cold_01/blk1?size=1")});
+    auto serving_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("tp0", "dummy://cold_01/blk2?size=1")});
+    std::vector<std::string> ids;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1, 2}, {writing_loc, serving_loc}, ids));
+    ASSERT_EQ(2u, ids.size());
+    std::vector<std::vector<MetaSearcher::LocationCASTask>> cas_tasks{
+        {MetaSearcher::LocationCASTask{ids[1], CLS_WRITING, CLS_SERVING}}};
+    std::vector<std::vector<ErrorCode>> cas_results;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchCASLocationStatus(request_context_.get(), {2}, cas_tasks, cas_results));
+    cache_manager_->migration_manager()->MarkForTieredWrite("placeholder_id", {1, 2}, "cold_01");
+
+    CacheManager::KeyVector keys = {1, 2};
+    CacheManager::KeyVector new_keys;
+    std::vector<std::string_view> new_sgn;
+    BlockMask block_mask;
+    std::vector<std::string> new_targets;
+    auto ec = cache_manager_->FilterWriteCache(
+        request_context_.get(), "placeholder_id", meta_searcher, keys, new_keys, {}, new_sgn, block_mask, new_targets);
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_TRUE(new_keys.empty());
+    ASSERT_TRUE(new_targets.empty());
+}
+
+// GenWriteLocation 按 block 路由：marked block 的 location 落在目标冷 storage
+TEST_F(CacheManagerTest, TestGenWriteLocationTieredRouting) {
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "placeholder_id",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    // 注册冷存储 cold_01（dummy）
+    {
+        auto spec = std::make_shared<DummyStorageSpec>();
+        spec->set_root_path("/tmp/kvcm_cold_p5/");
+        spec->set_key_count_per_file(1);
+        StorageConfig config;
+        config.set_type(DataStorageType::DATA_STORAGE_TYPE_DUMMY);
+        config.set_global_unique_name("cold_01");
+        config.set_storage_spec(spec);
+        ASSERT_EQ(EC_OK,
+                  registry_manager_->data_storage_manager()->RegisterStorage(
+                      request_context_.get(), "cold_01", config));
+    }
+
+    CacheManager::KeyVector new_keys = {1, 2};
+    std::vector<std::string_view> new_sgn;
+    std::vector<std::string> tiered_targets = {"", "cold_01"}; // block 2 -> 冷层
+    CacheLocationVector new_locations;
+    auto ec = cache_manager_->GenWriteLocation(
+        request_context_.get(), "placeholder_id", new_keys, new_sgn, tiered_targets, new_locations);
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(2u, new_locations.size());
+    // block 2 被路由到 cold_01（DUMMY 类型）；block 1 走默认 storage（非 DUMMY）
+    ASSERT_TRUE(new_locations[1] != nullptr && new_locations[0] != nullptr);
+    ASSERT_EQ(DataStorageType::DATA_STORAGE_TYPE_DUMMY, new_locations[1]->type());
+    ASSERT_NE(DataStorageType::DATA_STORAGE_TYPE_DUMMY, new_locations[0]->type());
+}
+
+// FinishWriteCache 成功后清除 tiered-write mark
+TEST_F(CacheManagerTest, TestFinishWriteCacheClearsTieredMark) {
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "placeholder_id",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("placeholder_id");
+    ASSERT_TRUE(meta_searcher);
+    {
+        auto loc = std::make_shared<CacheLocation>(
+            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+            1,
+            std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot/blk1?size=1")});
+        std::vector<std::string> ids;
+        ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {loc}, ids));
+    }
+    cache_manager_->migration_manager()->MarkForTieredWrite("placeholder_id", {1}, "cold_01");
+    ASSERT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("placeholder_id", 1));
+
+    auto info = std::make_unique<WriteLocationManager::WriteLocationInfo>();
+    info->keys = {1};
+    info->location_ids = {"loc_x"};
+    BlockMask success_mask = static_cast<BlockMaskOffset>(1); // 全部成功
+    auto ec = cache_manager_->FinishWriteCache(
+        request_context_.get(), "placeholder_id", "sess_p5", success_mask, std::move(info));
+    static_cast<void>(ec); // 即使底层 location 不存在，清标也应执行
+    ASSERT_FALSE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("placeholder_id", 1));
 }
 
 } // namespace kv_cache_manager

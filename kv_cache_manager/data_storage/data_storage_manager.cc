@@ -230,6 +230,25 @@ std::vector<ErrorCode> DataStorageManager::Delete(RequestContext *request_contex
     return storage_backend->Delete(storage_uris, trace_id, cb);
 }
 
+std::vector<ErrorCode> DataStorageManager::Copy(RequestContext *request_context,
+                                                const std::string &unique_name,
+                                                const std::vector<DataStorageUri> &src_uris,
+                                                const std::vector<DataStorageUri> &dst_uris) {
+    SPAN_TRACER(request_context);
+    if (src_uris.empty()) {
+        return {};
+    }
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
+    const std::string &trace_id = request_context->trace_id();
+    auto iter = storage_map_.find(unique_name);
+    if (iter == storage_map_.end()) {
+        KVCM_LOG_WARN("Storage name: %s not exist", unique_name.c_str());
+        return std::vector<ErrorCode>(src_uris.size(), ErrorCode::EC_NOENT);
+    }
+    auto storage_backend = iter->second;
+    return storage_backend->Copy(src_uris, dst_uris, trace_id);
+}
+
 std::vector<bool> DataStorageManager::Exist(const std::string &unique_name,
                                             const std::vector<DataStorageUri> &storage_uris,
                                             bool fastpath) {
